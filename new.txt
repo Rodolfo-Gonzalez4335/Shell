@@ -1,3 +1,0 @@
-ttii  ssiipptt  rrnn  llaaee
-
-cat < output.txt > what.txt

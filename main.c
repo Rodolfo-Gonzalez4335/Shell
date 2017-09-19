@@ -16,11 +16,13 @@
 #define MAXSIZE 2000
 #define _GNU_SOURCE
 bool pipe_flag=false;
+bool std_error_flag=false;
 int pipefd[2];
+int pid1,pid2,pid;
 int status;
 int command_size=0;
 int temp;
-int saved_stdout,saved_stdin;
+int saved_stdout,saved_stdin,saved_stderr;
 //special child inputs "|"
 //signals to keep in mind SIGINT,SIGTSTP,SIGCHLD
 //SPECIAL PIPING &
@@ -30,29 +32,38 @@ typedef struct {
   char* std_error;
 }Commands;
 
-static int fd1,fd2;
+static int fd1,fd2,fd3;
 static void closefd(int);
 static int openfd(const char *pathname,int falgs,mode_t mode);
 static int dup3fd(int oldfd,int newfd,int flags);
 
+int finderror(char** commands, int start,int size);
 int findpipe(char** commands, int start);
-char **algorithm(int argc,char **argv,int index, char **commands);
+char **algorithm(int argc,char **argv,int index, char **commands, int size);
 char *readlinee(void);
 char **interpret(char* line);
 int execute(char** commands);
 int casefunc(char *commands);
 
+static void sig_int(int signo) {
+  printf("Sending signals to group:%d\n",pid1); // group id is pid of first in pipeline
+  kill(-pid1,SIGINT);
+}
+static void sig_tstp(int signo) {
+  printf("Sending SIGTSTP to group:%d\n",pid1); // group id is pid of first in pipeline
+  kill(-pid1,SIGTSTP);
+}
+
 int main(int argc, char* argv[])
 {
 
-    int pd[2];
-    pid_t pid;
     char *pager, *argv0;
     char *line;
     char **commands;
     int status;//seeing if it does excecute
     saved_stdout=dup(1);
     saved_stdin=dup(0);
+    saved_stderr=dup(2);
     if (argc!=1)
       printf("execute yash with no arguments");
     else
@@ -110,12 +121,12 @@ char  *readlinee(void){
   char temp;
   dup2(saved_stdout,0);
   dup2(saved_stdin,1);
-
-
+  dup2(saved_stderr,2);
+  printf("# ");
   do{
     c = getchar();
     if (c==EOF) perror("getchar error");
-    printf("%c",c);
+    //printf("%c",c);
     //check if EOF must have different out put
     if (c == EOF || c=='\n')
       {
@@ -138,6 +149,8 @@ char **interpret(char* line)
   char *token;
   int index=0;
   command_size=0;
+  pipe_flag=false;
+  std_error_flag=false;
 
   if (tokens==NULL)
     printf("no memory allocated");
@@ -147,16 +160,30 @@ char **interpret(char* line)
   while(token!=NULL)
   {
     tokens[index]= token;
-    if(*token=='|') {
+    if(strcmp(token,"|")==0) {
       pipe_flag =true;
       //printf("pipe in place");
     }
+    if(strcmp(token,"2>")==0)
+      std_error_flag=true;
       token=strtok(NULL,"  ");
     index++;
     command_size++;
   }
   //free(line);
   return tokens;
+}
+
+
+int finderror(char** commands, int start,int size){
+
+  for(int i=start; i<size; i++)
+    {
+      if(strcmp(commands[i],"2>")==0)
+	return i;
+    }
+  perror("No error char found");
+  return 0;
 }
 
 int findpipe(char** commands, int start)
@@ -169,103 +196,175 @@ int findpipe(char** commands, int start)
   perror("No pipe char found");
   return 0;
 }
-char **algorithm(int argc,char **argv,int index, char **commands)
+char **algorithm(int argc,char **argv,int index, char **commands,int command_size)
 {
   int result;
   char buf;
-  int fd1,fd2,fd3;
   int tempfd;
   int fdflag=false;
   int pid;
-        for (int i=index; i<command_size; i++)
-	{
-	  result = casefunc(commands[i]);
+  if (std_error_flag)//need to adjut so that it just prints error but not terminate
+    {
+      int error_index = finderror(commands,index,command_size);
+      fd3=openfd(commands[error_index+1],O_RDWR|O_CREAT|O_ASYNC|O_CLOEXEC,O_DIRECTORY|S_IRWXU|S_IRWXG|S_IRWXO);
+      close(2);
+      dup3fd(fd3,2,O_CLOEXEC);//0 write //1 read
+      closefd(fd3);
+    }
 
-	  switch (result)
-	    {
-	    case 0://>
-	      fd1=openfd(commands[i+1],O_WRONLY|O_CREAT|O_CLOEXEC,O_DIRECTORY|O_EXCL);
+  
+  for (int i=index; i<command_size; i++)
+    {
+      result = casefunc(commands[i]);
+
+      switch (result)
+	{
+	case 0://>
+	  fd1=openfd(commands[i+1],O_WRONLY|O_ASYNC|O_CREAT|O_CLOEXEC,O_DIRECTORY|O_EXCL);
 	     
-	      dup3fd(fd1,0,O_CLOEXEC);//0 write //1 read
-	      closefd(fd1);
+	  dup3fd(fd1,0,O_CLOEXEC);//0 write //1 read
+	  closefd(fd1);
 	      
-	      fd2=openfd(commands[i-1],O_RDONLY|O_CLOEXEC,O_DIRECTORY|O_EXCL);
-	      dup3fd(fd2,1,O_CLOEXEC);
+	  fd2=openfd(commands[i-1],O_RDONLY|O_CLOEXEC,O_DIRECTORY|O_EXCL);
+	  dup3fd(fd2,1,O_CLOEXEC);
+	  closefd(fd2);
+	      
+	  while(read(1,&buf,1)>0)
+	    write(0,&buf,1);
+	  argc--;
+	  argv[argc]=NULL;
+	  i++;
+	  break;
+	case 1://<	    
+	  pid=fork();
+	  if (pid==0)
+	    {
+	      fd2=openfd(commands[i+1],O_RDONLY|O_ASYNC|O_CLOEXEC,O_EXCL|O_DIRECTORY);
+	      dup3fd(fd2,0,O_CLOEXEC);
 	      closefd(fd2);
-	      
-	      while(read(1,&buf,1)>0)
-		write(0,&buf,1);
-	      argc--;
-	      argv[argc]=NULL;
-	      i++;
-	      break;
-	    case 1://<	    
-	      pid=fork();
-	      if (pid==0)
+	      argv[argc]= commands[i+1];
+	      while (casefunc(commands[i-1])==-1)
 		{
-		  fd2=openfd(commands[i+1],O_RDONLY|O_CLOEXEC,O_EXCL|O_DIRECTORY);
-		  //Need to check if not opened
-		  //closefd(0);
-		  dup3fd(fd2,0,O_CLOEXEC);
-		  closefd(fd2);
-		  argv[argc]= commands[i+1];
 		  argv[argc-1]=commands[i-1];
-		  execlp(argv[argc-1],argv[argc],NULL);
-		  perror("COuld not execute");
-		  exit(1);
+		  argc--;
+		  i--;
 		}
-	      else if(pid>0) {
-		waitpid(-1, &status, 0);
-		argc--;
-		argv[argc]=NULL;
-		i++;
-	      }
-	      break;
-	    case 2://2>
-	      fd3=openfd(commands[i+1],O_RDWR|O_CREAT|O_ASYNC|O_CLOEXEC,O_DIRECTORY|S_IRWXU|S_IRWXG|S_IRWXO);
-	      dup3fd(fd3,2,O_CLOEXEC);//0 write //1 read
-	      closefd(fd3);
-	      i++;
-	      break;
-	    case 3://|
-	      // Code
-	      break;
-	    case 4://&
-	      // Code
-	      break;
-	    case 5://
-	      // code
-	      break;
-	    default:
-	      argv[argc]=commands[i];
-	      argc++;
-	      break;
+	      execlp(argv[argc],argv[argc],NULL);
+	      perror("COuld not execute");
+	      exit(1);
 	    }
-	}
-	pid=fork();
-	if (pid==0)
-	  {
-	    argv[argc]=NULL;
-	    execvp(argv[index],argv);
-	    perror("COuld not execute");
-	    kill(pid,SIGTERM);
-	    exit(1);
-	  }
-	else if(pid>0)
-	  {
+	  else if(pid>0) {
 	    waitpid(-1, &status, 0);
+	    argc--;
+	    argv[argc]=NULL;
+	    i++;
 	  }
+	  break;
+	case 2://2>
+	  //taken care of on top
+	  i++;
+	  break;
+	case 3://|
+	  //while (write(pipefd[1],&buf,1)!=0)
+	  argv[argc]=NULL;
+	  execvp(argv[0],argv);
+	  perror("COuld not execute");
+	  exit(1);
+	  break;
+	case 4://&
+	  // Code
+	  break;
+	case 5://
+	  // code
+	  break;
+	default:
+	  argv[argc]=commands[i];
+	  argc++;
+	  break;
+	}
+    }
+  //	pid=fork();
+  //if (pid==0)
+  // {
+  argv[argc]=NULL;
+  execvp(argv[0],argv);
+  perror("COuld not execute");
+  kill(pid,SIGTERM);
+  exit(1);
+  /* }
+     else if(pid>0)
+     {
+     waitpid(-1, &status, 0);
+     }*/
 	
 }
 
 int execute(char **commands)
 {
   //pipefd[0] read pipefd[1] write
-  int pid;
   int index=0,result;
   char **argv= malloc(sizeof(char*)*MAXSIZE),buf;
-  int argc=0;   
-  algorithm(argc,argv,0,commands); 
+  int argc=0;
+  int pipeloc;
+  if (!pipe_flag)
+    algorithm(argc,argv,0,commands,command_size);
+  else {
+    pipeloc=findpipe(commands,0);
+    if (pipe(pipefd)<0) perror("pipe creation error");
+    pid1=fork();
+    if (pid1<0) {perror("error generating child"); exit(1);}
+    else if(pid1>0)
+      {
+	
+	pid2=fork();
+	 if (pid2<0) {perror("error generating child"); exit(1);}
+	 else if (pid2>0){//parent
+	   closefd(pipefd[0]);
+	   closefd(pipefd[1]);
+	   int count=0;
+	   while (count<2){
+	     waitpid(-1, &status, WUNTRACED | WCONTINUED);
+	     if (pid2 == -1) 
+	       {
+		   perror("waitpid");
+		   exit(EXIT_FAILURE);
+	       }
+	       
+	       if (WIFEXITED(status)) {
+		 printf("child %d exited, status=%d\n", pid, WEXITSTATUS(status));count++;
+	       } else if (WIFSIGNALED(status)) {
+		 printf("child %d killed by signal %d\n", pid, WTERMSIG(status));count++;
+	       } else if (WIFSTOPPED(status)) {
+		 printf("%d stopped by signal %d\n", pid,WSTOPSIG(status));
+		 printf("Sending CONT to %d\n", pid);
+		 sleep(4); //sleep for 4 seconds before sending CONT
+		 kill(pid,SIGCONT);
+	       } else if (WIFCONTINUED(status)) {
+		 printf("Continuing %d\n",pid);
+	       }
+	   }
+	 }
+	 else 
+	   {//child 2
+	     	sleep(1);
+		setpgid(0,pid1);
+		closefd(pipefd[1]);//right side of pipe
+		dup3fd(pipefd[0], STDIN_FILENO,0);
+		//closefd(pipefd[0]);
+		algorithm(argc,argv,pipeloc+1,commands,command_size);
+		
+	   }
+	 
+      }
+    else 
+      {//child 1
+	setsid();
+	closefd(pipefd[0]);
+	dup3fd(pipefd[1], STDOUT_FILENO,0);
+	algorithm(argc,argv,0,commands,pipeloc+1);//leftside of pipe
+      }
+          
+  }
   return status;
 }
 //casefunc '>'=0 '<'=1 '2>'=2 '|'=3 '&'=4  
